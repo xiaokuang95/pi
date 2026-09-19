@@ -78,6 +78,7 @@ describe("DefaultPackageManager", () => {
 		delete process.env.PI_OFFLINE;
 		tempDir = join(tmpdir(), `pm-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
+		mkdirSync(join(tempDir, ".git"), { recursive: true });
 		agentDir = join(tempDir, "agent");
 		mkdirSync(agentDir, { recursive: true });
 

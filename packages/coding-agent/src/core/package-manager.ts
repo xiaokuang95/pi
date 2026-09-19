@@ -42,6 +42,7 @@ import { spawnProcess, spawnProcessSync } from "../utils/child-process.ts";
 import { type GitSource, parseGitUrl } from "../utils/git.ts";
 import { canonicalizePath, isLocalPath, markPathIgnoredByCloudSync, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
+import { compileTypeScriptExtensionEntries } from "./extensions/compile.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
 import { type PiManifest, readPiManifest } from "./pi-manifest.ts";
 import type { PackageSource, SettingsManager } from "./settings-manager.ts";
@@ -1181,6 +1182,9 @@ export class DefaultPackageManager implements PackageManager {
 		const installRoot = this.getNpmInstallRoot(scope, false);
 		this.ensureNpmProject(installRoot);
 		await this.runNpmCommand(this.getNpmInstallArgs(specs, installRoot));
+		for (const spec of specs) {
+			await this.compileInstalledPackage(join(installRoot, "node_modules", this.parseNpmSpec(spec).name));
+		}
 	}
 
 	async checkForAvailableUpdates(): Promise<PackageUpdate[]> {
@@ -1517,7 +1521,12 @@ export class DefaultPackageManager implements PackageManager {
 		);
 		const raw = stdout.trim();
 		if (!raw) throw new Error("Empty response from npm view");
-		const parsed = JSON.parse(raw) as unknown;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw) as unknown;
+		} catch {
+			throw new Error("Unexpected response from npm view");
+		}
 		if (typeof parsed === "string") {
 			return parsed;
 		}
@@ -1809,6 +1818,7 @@ export class DefaultPackageManager implements PackageManager {
 		const installRoot = this.getNpmInstallRoot(scope, temporary);
 		this.ensureNpmProject(installRoot);
 		await this.runNpmCommand(this.getNpmInstallArgs([source.spec], installRoot));
+		await this.compileInstalledPackage(this.getNpmInstallPath(source, scope));
 	}
 
 	private async uninstallNpm(source: NpmSource, scope: SourceScope): Promise<void> {
@@ -1833,10 +1843,12 @@ export class DefaultPackageManager implements PackageManager {
 		if (existsSync(targetDir)) {
 			if (source.ref) {
 				await this.ensureGitRef(targetDir, ["fetch", "origin", source.ref], "FETCH_HEAD");
+				await this.compileInstalledPackage(targetDir);
 				return;
 			}
 			const target = await this.getLocalGitUpdateTarget(targetDir);
 			await this.ensureGitRef(targetDir, target.fetchArgs, target.ref);
+			await this.compileInstalledPackage(targetDir);
 			return;
 		}
 		const gitRoot = this.getGitInstallRoot(scope);
@@ -1855,10 +1867,28 @@ export class DefaultPackageManager implements PackageManager {
 			if (existsSync(packageJsonPath)) {
 				await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
 			}
+			await this.compileInstalledPackage(targetDir);
 		} catch (error) {
 			rmSync(targetDir, { recursive: true, force: true });
 			this.pruneEmptyGitParents(targetDir, gitRoot);
 			throw error;
+		}
+	}
+
+	private async compileInstalledPackage(packageRoot: string): Promise<void> {
+		if (!existsSync(packageRoot)) {
+			return;
+		}
+		try {
+			const manifestEntries = resolveExtensionEntries(packageRoot);
+			const entries =
+				manifestEntries ??
+				(existsSync(join(packageRoot, "extensions"))
+					? collectAutoExtensionEntries(join(packageRoot, "extensions"))
+					: []);
+			await compileTypeScriptExtensionEntries(entries);
+		} catch {
+			// Load path compiles on demand or falls back to jiti.
 		}
 	}
 
@@ -1871,11 +1901,13 @@ export class DefaultPackageManager implements PackageManager {
 
 		if (source.ref) {
 			await this.ensureGitRef(targetDir, ["fetch", "origin", source.ref], "FETCH_HEAD");
+			await this.compileInstalledPackage(targetDir);
 			return;
 		}
 
 		const target = await this.getLocalGitUpdateTarget(targetDir);
 		await this.ensureGitRef(targetDir, target.fetchArgs, target.ref);
+		await this.compileInstalledPackage(targetDir);
 	}
 
 	private hasMissingGitDependencies(targetDir: string): boolean {
@@ -2055,7 +2087,12 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		const output = this.runNpmCommandSync(["list", "-g", "--depth", "0", "--json"]);
-		const entries = JSON.parse(output) as Array<{ dependencies?: Record<string, { path?: string }> }>;
+		let entries: Array<{ dependencies?: Record<string, { path?: string }> }>;
+		try {
+			entries = JSON.parse(output) as Array<{ dependencies?: Record<string, { path?: string }> }>;
+		} catch {
+			return undefined;
+		}
 		for (const entry of entries) {
 			const path = entry.dependencies?.[packageName]?.path;
 			if (path) return path;

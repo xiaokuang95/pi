@@ -1,12 +1,13 @@
 /**
- * Extension loader - loads TypeScript extension modules using jiti.
- *
+ * Extension loader. TypeScript entries compile to sidecar `.pi.mjs` when possible;
+ * jiti remains the fallback. Host packages use virtualModules so jiti does not
+ * transpile pi's own tree on every extension.
  */
 
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import * as _bundledPiAgentCore from "@earendil-works/pi-agent-core";
 import type { Provider } from "@earendil-works/pi-ai";
 import * as _bundledPiAiCompat from "@earendil-works/pi-ai/compat";
@@ -32,6 +33,7 @@ import { execCommand } from "../exec.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
 import { time } from "../timings.ts";
+import { compileExtensionToJs, isTypeScriptExtensionPath } from "./compile.ts";
 import type {
 	EntryRenderer,
 	Extension,
@@ -500,6 +502,45 @@ function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cache
 	);
 }
 
+let jitiInstance: ReturnType<typeof createJiti> | undefined;
+
+function getJiti(): ReturnType<typeof createJiti> {
+	if (jitiInstance) {
+		return jitiInstance;
+	}
+	const bundled = isBunBinary || isNodeSeaBinary || isBundledNode;
+	let extra: { tsconfigPaths: true } | { alias: Record<string, string> } | Record<string, never> = {};
+	if (isTypeScriptSourceRuntime) {
+		extra = { tsconfigPaths: true };
+	} else if (!bundled) {
+		extra = { alias: getAliases() };
+	}
+	jitiInstance = createJiti(import.meta.url, {
+		moduleCache: false,
+		virtualModules: VIRTUAL_MODULES,
+		tryNative: false,
+		...extra,
+	});
+	return jitiInstance;
+}
+
+async function importExtensionFactory(extensionPath: string): Promise<ExtensionFactory | undefined> {
+	if (!isBunBinary && !isNodeSeaBinary && !isBundledNode && isTypeScriptExtensionPath(extensionPath)) {
+		try {
+			const jsPath = await compileExtensionToJs(extensionPath);
+			const compiled = await import(pathToFileURL(jsPath).href);
+			const factory = (compiled as { default?: unknown }).default ?? compiled;
+			if (typeof factory === "function") {
+				return factory as ExtensionFactory;
+			}
+		} catch {
+			// jiti still handles binaries, host subpaths, and compile failures.
+		}
+	}
+	const module = await getJiti().import(extensionPath, { default: true });
+	return typeof module === "function" ? (module as ExtensionFactory) : undefined;
+}
+
 async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
 	if (isCurrentCacheToken(cacheToken)) {
 		const cachedFactory = extensionCache.get(extensionPath);
@@ -508,20 +549,7 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		}
 	}
 
-	const jiti = createJiti(import.meta.url, {
-		moduleCache: false,
-		// Compiled binaries and the bundled Node distribution use embedded modules.
-		// Source TypeScript reuses host modules and root tsconfig paths. Unbundled
-		// Node builds use dist aliases.
-		...(isBunBinary || isNodeSeaBinary || isBundledNode
-			? { virtualModules: VIRTUAL_MODULES, tryNative: false }
-			: isTypeScriptSourceRuntime
-				? { virtualModules: VIRTUAL_MODULES, tsconfigPaths: true }
-				: { alias: getAliases() }),
-	});
-
-	const module = await jiti.import(extensionPath, { default: true });
-	const factory = module as ExtensionFactory;
+	const factory = await importExtensionFactory(extensionPath);
 	if (typeof factory !== "function") {
 		return undefined;
 	}
@@ -576,31 +604,6 @@ async function initializeExtension(
 	return extension;
 }
 
-async function loadExtension(
-	extensionPath: string,
-	cwd: string,
-	eventBus: EventBus,
-	runtime: ExtensionRuntime,
-	cacheToken?: ExtensionCacheToken,
-): Promise<{ extension: Extension | null; error: string | null }> {
-	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
-
-	try {
-		const factory = await loadExtensionModule(resolvedPath, cacheToken);
-		time(`${extensionPath} module import`, "extensions");
-		if (!factory) {
-			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
-		}
-
-		const extension = await initializeExtension(factory, extensionPath, resolvedPath, cwd, eventBus, runtime);
-
-		return { extension, error: null };
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		return { extension: null, error: `Failed to load extension: ${message}` };
-	}
-}
-
 /**
  * Create an Extension from an inline factory function.
  */
@@ -632,22 +635,50 @@ async function loadExtensionsInternal(
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const resolvedRuntime = runtime ?? createExtensionRuntime();
 
-	for (const extPath of paths) {
-		const { extension, error } = await loadExtension(
-			extPath,
-			resolvedCwd,
-			resolvedEventBus,
-			resolvedRuntime,
-			cacheToken,
-		);
+	const imported = await Promise.all(
+		paths.map(async (extPath) => {
+			const resolvedPath = resolvePath(extPath, resolvedCwd, { normalizeUnicodeSpaces: true });
+			try {
+				const factory = await loadExtensionModule(resolvedPath, cacheToken);
+				time(`${extPath} module import`, "extensions");
+				return { extPath, resolvedPath, factory, error: null as string | null };
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return {
+					extPath,
+					resolvedPath,
+					factory: undefined,
+					error: `Failed to load extension: ${message}`,
+				};
+			}
+		}),
+	);
 
-		if (error) {
-			errors.push({ path: extPath, error });
+	for (const item of imported) {
+		if (item.error) {
+			errors.push({ path: item.extPath, error: item.error });
 			continue;
 		}
-
-		if (extension) {
+		if (!item.factory) {
+			errors.push({
+				path: item.extPath,
+				error: `Extension does not export a valid factory function: ${item.extPath}`,
+			});
+			continue;
+		}
+		try {
+			const extension = await initializeExtension(
+				item.factory,
+				item.extPath,
+				item.resolvedPath,
+				resolvedCwd,
+				resolvedEventBus,
+				resolvedRuntime,
+			);
 			extensions.push(extension);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			errors.push({ path: item.extPath, error: `Failed to load extension: ${message}` });
 		}
 	}
 

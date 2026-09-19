@@ -242,6 +242,41 @@ function isCompactionCostNotice(item: RenderSessionItem): item is CompactionCost
 	return "type" in item && item.type === "compaction_cost";
 }
 
+const INITIAL_SESSION_RENDER_TAIL = 48;
+const SESSION_RENDER_OLDER_CHUNK = 32;
+
+export function isSessionRenderBoundary(entry: SessionEntry): boolean {
+	if (entry.type === "compaction" || entry.type === "branch_summary" || entry.type === "custom") {
+		return true;
+	}
+	return entry.type === "message" && entry.message.role === "user";
+}
+
+export function findSessionRenderTailStart(entries: readonly SessionEntry[], minTail: number): number {
+	if (entries.length <= minTail) {
+		return 0;
+	}
+	let index = entries.length - minTail;
+	while (index > 0 && !isSessionRenderBoundary(entries[index]!)) {
+		index--;
+	}
+	return index;
+}
+
+export function takeOlderSessionRenderChunk(
+	entries: SessionEntry[],
+	chunkSize: number,
+): { chunk: SessionEntry[]; rest: SessionEntry[] } {
+	if (entries.length <= chunkSize) {
+		return { chunk: entries, rest: [] };
+	}
+	let index = entries.length - chunkSize;
+	while (index > 0 && !isSessionRenderBoundary(entries[index]!)) {
+		index--;
+	}
+	return { chunk: entries.slice(index), rest: entries.slice(0, index) };
+}
+
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 
 function isDeadTerminalError(error: unknown): boolean {
@@ -404,6 +439,7 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
+	private olderSessionRenderTimer: ReturnType<typeof setImmediate> | undefined;
 	private onInputCallback?: (text: string) => void;
 	private pendingUserInputs: string[] = [];
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
@@ -3891,12 +3927,17 @@ export class InteractiveMode {
 	}
 
 	renderInitialMessages(): void {
+		this.cancelOlderSessionRender();
 		const entries = this.sessionManager.buildContextEntries();
-		this.renderSessionEntries(entries, {
+		this.populateEditorHistoryFromEntries(entries);
+		const tailStart = findSessionRenderTailStart(entries, INITIAL_SESSION_RENDER_TAIL);
+		this.renderSessionEntries(entries.slice(tailStart), {
 			updateFooter: true,
-			populateHistory: true,
 		});
 		this.renderProjectTrustWarningIfNeeded();
+		if (tailStart > 0) {
+			this.scheduleOlderSessionRender(entries.slice(0, tailStart));
+		}
 
 		// Show compaction info if session was compacted
 		const allEntries = this.sessionManager.getEntries();
@@ -3941,7 +3982,55 @@ export class InteractiveMode {
 		});
 	}
 
+	private cancelOlderSessionRender(): void {
+		if (!this.olderSessionRenderTimer) {
+			return;
+		}
+		clearImmediate(this.olderSessionRenderTimer);
+		this.olderSessionRenderTimer = undefined;
+	}
+
+	private prependSessionEntries(entries: SessionEntry[]): void {
+		const existing = this.chatContainer.children.slice();
+		this.chatContainer.clear();
+		this.renderSessionEntries(entries);
+		for (const child of existing) {
+			this.chatContainer.addChild(child);
+		}
+	}
+
+	private scheduleOlderSessionRender(older: SessionEntry[]): void {
+		this.cancelOlderSessionRender();
+		const pump = (): void => {
+			this.olderSessionRenderTimer = undefined;
+			if (!this.isInitialized || older.length === 0) {
+				return;
+			}
+			const { chunk, rest } = takeOlderSessionRenderChunk(older, SESSION_RENDER_OLDER_CHUNK);
+			older = rest;
+			this.prependSessionEntries(chunk);
+			this.ui.requestRender();
+			if (older.length > 0) {
+				this.olderSessionRenderTimer = setImmediate(pump);
+			}
+		};
+		this.olderSessionRenderTimer = setImmediate(pump);
+	}
+
+	private populateEditorHistoryFromEntries(entries: SessionEntry[]): void {
+		for (const entry of entries) {
+			if (entry.type !== "message" || entry.message.role !== "user") {
+				continue;
+			}
+			const textContent = this.getUserMessageText(entry.message);
+			if (textContent) {
+				this.editor.addToHistory?.(textContent);
+			}
+		}
+	}
+
 	private rebuildChatFromMessages(): void {
+		this.cancelOlderSessionRender();
 		this.chatContainer.clear();
 		this.renderSessionEntries(this.sessionManager.buildContextEntries());
 	}
@@ -4040,13 +4129,19 @@ export class InteractiveMode {
 		this.isShuttingDown = true;
 		try {
 			this.unregisterSignalHandlers();
-		} catch {}
+		} catch {
+			// Continue crash shutdown even if cleanup throws.
+		}
 		try {
 			killTrackedDetachedChildren();
-		} catch {}
+		} catch {
+			// Continue crash shutdown even if cleanup throws.
+		}
 		try {
 			this.ui.stop();
-		} catch {}
+		} catch {
+			// Continue crash shutdown even if cleanup throws.
+		}
 		console.error(`${APP_NAME} exiting due to uncaughtException:`);
 		console.error(error);
 		process.exit(1);
@@ -6632,6 +6727,7 @@ export class InteractiveMode {
 			this.ui.terminal.setProgress(false);
 		}
 		this.clearStatusIndicator();
+		this.cancelOlderSessionRender();
 		this.themeController.disableAutoSync();
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();
