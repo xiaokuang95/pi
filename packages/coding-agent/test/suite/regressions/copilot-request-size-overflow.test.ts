@@ -6,6 +6,17 @@ const COPILOT_413 = 'github-copilot API error (413): {"message":"failed to parse
 const REQUEST_LIMIT = 32 * 1024 * 1024;
 const RECENT_PROMPT = "Continue the task using the recent notes.";
 
+/** 1x1 PNG header plus padding so token estimates stay tiny while the JSON payload exceeds Copilot's 32MB limit. */
+function largePngPayload(): string {
+	const header = Buffer.alloc(24);
+	header.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+	header.writeUInt32BE(13, 8);
+	header.write("IHDR", 12);
+	header.writeUInt32BE(1, 16);
+	header.writeUInt32BE(1, 20);
+	return Buffer.concat([header, Buffer.alloc(384 * 1024)]).toString("base64");
+}
+
 function seedImageHistory(harness: Harness, imageData: string): void {
 	const timestamp = Date.now() - 10_000;
 	const model = harness.getModel();
@@ -70,8 +81,7 @@ describe("Copilot request-size overflow recovery", () => {
 			models: [{ id: "faux-copilot", contextWindow: 1_000_000 }],
 		});
 		harnesses.push(harness);
-		// Synthetic base64 only; no image decoding or network calls are involved.
-		seedImageHistory(harness, "A".repeat(384 * 1024));
+		seedImageHistory(harness, largePngPayload());
 		harness.setResponses([
 			(context) => {
 				expect(Buffer.byteLength(JSON.stringify(context))).toBeGreaterThan(REQUEST_LIMIT);

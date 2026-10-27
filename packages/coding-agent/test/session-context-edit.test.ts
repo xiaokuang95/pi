@@ -223,8 +223,8 @@ describe("session context edits", () => {
 
 		const estimate = estimateProjectedContextTokens(session.buildSessionProjection(), session.getBranch());
 		expect(estimate.usageTokens).toBe(4_100);
-		expect(estimate.trailingTokens).toBe(1);
-		expect(estimate.tokens).toBe(4_101);
+		expect(estimate.trailingTokens).toBe(2);
+		expect(estimate.tokens).toBe(4_102);
 	});
 
 	it("does not reuse post-edit assistant usage after a later compaction", () => {
