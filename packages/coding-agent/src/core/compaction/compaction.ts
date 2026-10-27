@@ -19,11 +19,15 @@ import type {
 	AssistantMessage,
 	Model,
 	SimpleStreamOptions,
-	SystemMessage,
 	TranscriptContext,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import {
+	estimateMessageTokens,
+	estimateTextAndImageContentTokens,
+	estimateTextTokens,
+} from "@earendil-works/pi-ai/utils/estimate";
 import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionProjection,
@@ -273,79 +277,19 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 // Cut point detection
 // ============================================================================
 
-const ESTIMATED_IMAGE_CHARS = 4800;
-
-function estimateTextAndImageContentChars(content: string | Array<{ type: string; text?: string }>): number {
-	if (typeof content === "string") {
-		return content.length;
-	}
-
-	let chars = 0;
-	for (const block of content) {
-		if (block.type === "text" && block.text) {
-			chars += block.text.length;
-		} else if (block.type === "image") {
-			chars += ESTIMATED_IMAGE_CHARS;
-		}
-	}
-	return chars;
-}
-
-/**
- * Estimate token count for a message using chars/4 heuristic.
- * This is conservative (overestimates tokens).
- */
+/** Estimate tokens for one agent message, including images by pixel count. */
 export function estimateTokens(message: AgentMessage): number {
-	let chars = 0;
-
 	switch (message.role) {
-		case "system": {
-			const system = message as SystemMessage;
-			chars = estimateTextAndImageContentChars(system.content);
-			if (system.sections) {
-				for (const section of Object.values(system.sections)) {
-					if (section) chars += section.length;
-				}
-			}
-			if (system.toolsAdded) chars += JSON.stringify(system.toolsAdded).length;
-			return Math.ceil(chars / 4);
-		}
-		case "user": {
-			chars = estimateTextAndImageContentChars(
-				(message as { content: string | Array<{ type: string; text?: string }> }).content,
-			);
-			return Math.ceil(chars / 4);
-		}
-		case "assistant": {
-			const assistant = message as AssistantMessage;
-			for (const block of assistant.content) {
-				if (block.type === "text") {
-					chars += block.text.length;
-				} else if (block.type === "thinking") {
-					chars += block.thinking.length;
-				} else if (block.type === "toolCall") {
-					chars += block.name.length + JSON.stringify(block.arguments).length;
-				}
-			}
-			return Math.ceil(chars / 4);
-		}
 		case "custom":
-		case "toolResult": {
-			chars = estimateTextAndImageContentChars(message.content);
-			return Math.ceil(chars / 4);
-		}
-		case "bashExecution": {
-			chars = message.command.length + message.output.length;
-			return Math.ceil(chars / 4);
-		}
+			return estimateTextAndImageContentTokens(message.content);
+		case "bashExecution":
+			return estimateTextTokens(message.command) + estimateTextTokens(message.output);
 		case "branchSummary":
-		case "compactionSummary": {
-			chars = message.summary.length;
-			return Math.ceil(chars / 4);
-		}
+		case "compactionSummary":
+			return estimateTextTokens(message.summary);
+		default:
+			return estimateMessageTokens(message);
 	}
-
-	return 0;
 }
 
 function isCutPointMessage(message: AgentMessage): boolean {

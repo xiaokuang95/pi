@@ -10,6 +10,7 @@ import {
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
+	estimateTokens,
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
@@ -268,6 +269,21 @@ describe("estimateContextTokens", () => {
 		expect(estimate.lastUsageIndex).toBe(1);
 		expect(estimate.trailingTokens).toBeGreaterThan(0);
 		expect(estimate.tokens).toBe(150 + estimate.trailingTokens);
+	});
+
+	it("counts attached image tokens from pixel dimensions", () => {
+		const bytes = Buffer.alloc(24);
+		bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+		bytes.writeUInt32BE(13, 8);
+		bytes.write("IHDR", 12);
+		bytes.writeUInt32BE(2000, 16);
+		bytes.writeUInt32BE(2000, 20);
+		const tokens = estimateTokens({
+			role: "user",
+			content: [{ type: "image", mimeType: "image/png", data: bytes.toString("base64") }],
+			timestamp: Date.now(),
+		});
+		expect(tokens).toBe(5_334);
 	});
 });
 
