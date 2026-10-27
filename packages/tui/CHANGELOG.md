@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-10-27
+
 ### Added
 
 - Added `replaceControlCharacters()` to replace runs of C0 and C1 control characters with a space

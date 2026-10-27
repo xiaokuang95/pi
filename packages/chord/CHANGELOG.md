@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-10-27
+
 ### Breaking Changes
 
 - `traceIn(options, fn, context)` takes the context last (was `traceIn(context, options, fn)`), like the rest of the API.

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-10-27
+
 ### Breaking Changes
 
 - `Storage.commit(writes, adopt, context)` takes an `adopt(seq)` callback, the Session's in-memory adoption and publication of the batch: a storage calls it exactly once, synchronously, once the batch is durable and before its next commit starts, then resolves with `seq`, and never for a commit that fails before the batch is durable. Memory, SQLite, JSONL, and IndexedDB storages do; custom storages and wrappers must call or forward it, and the storage conformance suite checks it. A commit that rejects after its adoption is published and fails the Session without rolling the adopted changes back.

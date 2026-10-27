@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-10-27
+
 ### Breaking Changes
 
 - `appendGrammarToolInputJsonDelta()` (`api/constrained-sampling`) takes the input delta instead of the whole input so far and no longer closes the input; close it with the new `closeGrammarToolInputJson()` ([#9265](https://github.com/earendil-works/pi/issues/9265))
